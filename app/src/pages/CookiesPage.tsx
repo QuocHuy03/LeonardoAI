@@ -35,6 +35,7 @@ export default function CookiesPage() {
   const cleanupRef = useRef<() => void>()
 
   useEffect(() => {
+    if (!window.leo) return
     loadList()
     // Subscribe to refresh progress
     const cleanup = window.leo.onCookiesProgress((d) => {

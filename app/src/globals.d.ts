@@ -29,9 +29,23 @@ declare global {
 
       fileSaveImage: (url: string, name: string) => Promise<{ ok: boolean; path?: string }>
       fileSaveZip:   (entries: { url: string; filename: string }[], zipName: string) => Promise<{ ok: boolean; path?: string }>
+      fileReadImage: (filePath: string) => Promise<string | null>
+
+      folderBrowse: () => Promise<string | null>
+      folderScan:   (folderPath: string) => Promise<{ images: string[]; prompts: string[] }>
+
+      authVerify:      () => Promise<{ success: boolean; expires_at?: string; error?: string }>
+      authLogin:       (key: string) => Promise<{ success: boolean; expires_at?: string; error?: string }>
+      authLogout:      () => Promise<void>
+      authGetDeviceId: () => Promise<string>
 
       onUpdaterEvent: (cb: (d: { event: string; data?: any }) => void) => () => void
       updaterInstall: () => void
+
+      charactersList:   () => Promise<CharacterRow[]>
+      charactersBrowse: () => Promise<string | null>
+      charactersCreate: (name: string, desc: string, imagePath: string) => Promise<{ ok: boolean; id: number }>
+      charactersDelete: (id: number) => Promise<{ ok: boolean }>
     }
   }
 
@@ -87,6 +101,14 @@ declare global {
     id: number
     name: string
     description: string
+    created_at: string
+  }
+
+  interface CharacterRow {
+    id: number
+    name: string
+    description: string
+    image_path: string
     created_at: string
   }
 }

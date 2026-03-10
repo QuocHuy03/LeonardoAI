@@ -5,13 +5,21 @@ import {
 } from 'antd'
 import {
   ThunderboltOutlined, DownloadOutlined,
-  PictureOutlined, FileTextOutlined, UploadOutlined,
+  PictureOutlined, FileTextOutlined,
   FolderOutlined, PlusOutlined, DeleteOutlined, FolderOpenOutlined, ReloadOutlined,
 } from '@ant-design/icons'
 import { MODELS, SIZES, CORE_COLORS, REF_TYPE_LABELS, REF_TYPE_COLORS, type AspectRatio } from '../constants'
 
 const { TextArea } = Input
 const { Text } = Typography
+
+// LocalImage: reads local file via IPC → base64 data URL (works in Electron renderer)
+function LocalImage({ path, style }: { path: string; style?: React.CSSProperties }) {
+  const [src, setSrc] = useState<string | null>(null)
+  useEffect(() => { if (path) window.leo.fileReadImage(path).then(setSrc) }, [path])
+  if (!src) return <div style={{ ...style, background: '#1c1c2e' }} />
+  return <img src={src} style={style} alt="" />
+}
 
 interface ResultRow {
   key: number
@@ -20,6 +28,8 @@ interface ResultRow {
   status: string
   url: string
   cookieId: number
+  charPreview?: string[]   // image_paths of matched characters (for pending preview)
+  folderImagePath?: string // local image from folder import, used as initImage
 }
 
 const RATIOS: AspectRatio[] = ['2:3', '1:1', '3:2', '16:9', '9:16']
@@ -41,9 +51,80 @@ export default function GeneratePage() {
   const [selectedKeys, setSelectedKeys] = useState<number[]>([])
   const [running, setRunning]       = useState(false)
   const [quantity, setQuantity]     = useState(1)
-  // Multiple reference images: each has a local path and an uploaded ID
-  const [refImages, setRefImages]   = useState<{ path: string; id: string | null; msg: string }[]>([])
+  const [characters, setCharacters] = useState<CharacterRow[]>([])
   const cleanupRef = useRef<(() => void) | null>(null)
+
+  // ── Character matching helper ──────────────────────────────────────────────
+  // Normalize: lowercase + collapse spaces/underscores → single space
+  const norm = (s: string) => s.toLowerCase().replace(/[_\s]+/g, ' ').trim()
+
+  function matchChar(prompt: string): CharacterRow | null {
+    const np = norm(prompt)
+    return characters.find(c => np.includes(norm(c.name))) ?? null
+  }
+
+  // Match ALL characters found in a prompt
+  function matchChars(prompt: string): CharacterRow[] {
+    const np = norm(prompt)
+    return characters.filter(c => np.includes(norm(c.name)))
+  }
+
+  // ── Parse prompts → table rows ───────────────────────────────────────────────
+  function handleParse() {
+    const lines = promptText.split('\n').map(l => l.trim()).filter(Boolean)
+    if (!lines.length) return message.warning('Enter at least one prompt')
+    const keyOffset = Date.now()
+    const rows: ResultRow[] = lines.map((p, i) => ({
+      key: keyOffset + i,
+      dbId: 0,
+      prompt: p,
+      status: 'Pending',
+      url: '',
+      cookieId: cookies[i % Math.max(cookies.length, 1)]?.id ?? 0,
+      charPreview: matchChars(p).map(c => c.image_path),
+    }))
+    setResults(rows)
+  }
+
+  // ── Folder import ───────────────────────────────────────────────────────
+  async function handleFolderImport() {
+    const folderPath = await window.leo.folderBrowse()
+    if (!folderPath) return
+    const { images, prompts: folderPrompts } = await window.leo.folderScan(folderPath)
+    if (!images.length) return message.warning('No images found in folder')
+
+    // Build a combined prompt pool:
+    // 1. prompts.txt lines from the folder
+    // 2. fallback: lines from the textarea prompt
+    // 3. If still not enough → cycle from start of pool
+    const textareaLines = promptText.split('\n').map(l => l.trim()).filter(Boolean)
+    const pool = folderPrompts.length ? folderPrompts : textareaLines
+    const getPrompt = (i: number) =>
+      pool.length ? pool[i % pool.length] : `Image ${i + 1}`
+
+    const keyOffset = Date.now()
+    const newRows: ResultRow[] = images.map((imgPath, i) => {
+      const prompt = getPrompt(i)
+      const chars  = matchChars(prompt)
+      return {
+        key: keyOffset + i,
+        dbId: 0,
+        prompt,
+        status: 'Pending',
+        url: '',
+        cookieId: cookies[i % Math.max(cookies.length, 1)]?.id ?? 0,
+        charPreview: chars.length ? chars.map(c => c.image_path) : [imgPath],
+        folderImagePath: imgPath,
+      }
+    })
+
+    // Merge: keep existing non-Pending rows, replace Pending ones with the new import
+    setResults(prev => {
+      const kept = prev.filter(r => r.status !== 'Pending')
+      return [...kept, ...newRows]
+    })
+    message.success(`Loaded ${images.length} images from folder`)
+  }
 
   const model     = MODELS.find(m => m.name === modelName) || MODELS[0]
   const sizeTiers = SIZES[ratio]
@@ -52,6 +133,7 @@ export default function GeneratePage() {
   useEffect(() => {
     loadCookies()
     loadProjects()
+    loadCharacters()
   }, [])
 
   // Reload results whenever activeProjectId changes
@@ -65,6 +147,10 @@ export default function GeneratePage() {
       const list = await window.leo.projectsList()
       setProjects(list)
     } catch {}
+  }
+
+  async function loadCharacters() {
+    try { setCharacters(await window.leo.charactersList()) } catch {}
   }
 
   async function loadHistory(projectId?: number) {
@@ -114,38 +200,8 @@ export default function GeneratePage() {
   }
 
   // ── Generate ──────────────────────────────────────────────────────────────
-  async function handleUploadImage() {
-    const filePaths = await window.leo.imageBrowse()
-    if (!filePaths) return
-    if (cookies.length === 0) {
-      message.warning('No READY cookies — cannot upload reference image')
-      return
-    }
-    // Add placeholders for all selected files
-    const startIdx = refImages.length
-    const newEntries = filePaths.map(p => ({ path: p, id: null, msg: 'Uploading…' }))
-    setRefImages(prev => [...prev, ...newEntries])
-
-    // Upload each file in parallel
-    await Promise.all(filePaths.map(async (fp, i) => {
-      try {
-        const id = await window.leo.imageUpload(cookies[0].id, fp)
-        setRefImages(prev => prev.map((e, idx) => idx === startIdx + i ? { ...e, id, msg: `✅ ${id.slice(0, 10)}…` } : e))
-      } catch (err: any) {
-        setRefImages(prev => prev.map((e, idx) => idx === startIdx + i ? { ...e, msg: `❌ ${err.message}` } : e))
-      }
-    }))
-  }
-
-  function handleRemoveRefImage(idx: number) {
-    setRefImages(prev => prev.filter((_, i) => i !== idx))
-  }
-
   async function handleGenerate() {
-    if (activeProjectId === null) {
-      setNewProjectModal(true)
-      return
-    }
+    if (activeProjectId === null) { setNewProjectModal(true); return }
     if (cookies.length === 0) {
       message.error('No READY cookies. Go to Cookies tab and refresh tokens.')
       return
@@ -153,8 +209,60 @@ export default function GeneratePage() {
     const prompts = promptText.split('\n').map(p => p.trim()).filter(Boolean)
     if (!prompts.length) { message.warning('Enter at least one prompt'); return }
 
-    const initImageIds = refImages.filter(r => r.id).map(r => r.id!) 
-    // N rows per prompt (quantity)
+    // Auto-detect & upload character images per prompt
+    // Also handle folder-imported images (per cookie cache)
+    const charUploadCache = new Map<string, string>()
+    const promptInitIds: (string[] | undefined)[] = []
+
+    message.loading({ content: 'Uploading references…', key: 'charUpload' })
+    await Promise.all(prompts.map(async (p, i) => {
+      const cookie = cookies[i % cookies.length]
+
+      // Folder image takes priority as initImage
+      const folderImg = results.find(r => r.prompt === p && r.folderImagePath)?.folderImagePath
+      if (folderImg && model.refType !== 'NONE') {
+        const cacheKey = `folder_${folderImg}_${cookie.id}`
+        try {
+          if (!charUploadCache.has(cacheKey)) {
+            const id = await window.leo.imageUpload(cookie.id, folderImg)
+            charUploadCache.set(cacheKey, id)
+          }
+          // Also include any character images found in the prompt
+          const charIds: string[] = [charUploadCache.get(cacheKey)!]
+          for (const char of matchChars(p)) {
+            const ck = `${char.id}_${cookie.id}`
+            if (!charUploadCache.has(ck)) {
+              const id = await window.leo.imageUpload(cookie.id, char.image_path)
+              charUploadCache.set(ck, id)
+            }
+            charIds.push(charUploadCache.get(ck)!)
+          }
+          promptInitIds[i] = charIds
+        } catch { promptInitIds[i] = undefined }
+        return
+      }
+
+      // Character-only (no folder image)
+      const chars = matchChars(p)
+      if (chars.length && model.refType !== 'NONE') {
+        const ids: string[] = []
+        for (const char of chars) {
+          const cacheKey = `${char.id}_${cookie.id}`
+          try {
+            if (!charUploadCache.has(cacheKey)) {
+              const id = await window.leo.imageUpload(cookie.id, char.image_path)
+              charUploadCache.set(cacheKey, id)
+            }
+            ids.push(charUploadCache.get(cacheKey)!)
+          } catch {}
+        }
+        promptInitIds[i] = ids.length ? ids : undefined
+      } else {
+        promptInitIds[i] = undefined
+      }
+    }))
+    message.destroy('charUpload')
+
     const keyOffset = Date.now()
     const newRows: ResultRow[] = []
     prompts.forEach((p, pi) => {
@@ -182,17 +290,18 @@ export default function GeneratePage() {
         width:        selSize.w,
         height:       selSize.h,
         quantity,
-        initImageIds: initImageIds.length ? initImageIds : undefined,
+        initImageIds: promptInitIds[i],
         projectId:    activeProjectId,
       }))
       await window.leo.generateRun(jobs)
       message.success('All jobs finished!')
-      await loadHistory(activeProjectId ?? undefined)
     } catch (e: any) {
       message.error(e.message)
     } finally {
       setRunning(false)
       cleanup()
+      // Always reload from DB so failed rows stay visible with their status
+      await loadHistory(activeProjectId ?? undefined)
     }
   }
 
@@ -243,7 +352,15 @@ export default function GeneratePage() {
 
   async function handleRetryRow(r: ResultRow) {
     if (activeProjectId === null || cookies.length === 0) return
-    const initImageIds = refImages.filter(x => x.id).map(x => x.id!)
+    // Auto-detect character for the retried prompt
+    const char = matchChar(r.prompt)
+    let initImageIds: string[] | undefined
+    if (char && model.refType !== 'NONE') {
+      try {
+        const id = await window.leo.imageUpload(cookies[0].id, char.image_path)
+        initImageIds = [id]
+      } catch {}
+    }
     const keyOffset = Date.now()
     const retryRow: ResultRow = { key: keyOffset, dbId: 0, prompt: r.prompt, status: 'Queued', url: '', cookieId: r.cookieId }
     setResults(prev => prev.map(x => x.key === r.key ? retryRow : x))
@@ -262,7 +379,7 @@ export default function GeneratePage() {
         width: selSize.w,
         height: selSize.h,
         quantity: 1,
-        initImageIds: initImageIds.length ? initImageIds : undefined,
+        initImageIds: initImageIds?.length ? initImageIds : undefined,
         projectId: activeProjectId,
       }
       await window.leo.generateRun([job])
@@ -281,14 +398,23 @@ export default function GeneratePage() {
     { title: '#', dataIndex: 'key', width: 44, align: 'center' as const, render: (v: number) => v + 1 },
     {
       title: 'Preview', dataIndex: 'url', width: 90, align: 'center' as const,
-      render: (url: string) =>
-        url ? (
+      render: (url: string, row: ResultRow) => {
+        if (url) return (
           <Image src={url} width={72} height={72} style={{ objectFit: 'cover', borderRadius: 6 }} preview={{ src: url }} />
-        ) : (
+        )
+        if (row.charPreview?.length) return (
+          <div style={{ display: 'flex', gap: 3, justifyContent: 'center', flexWrap: 'wrap' }}>
+            {row.charPreview.map((p, i) => (
+              <LocalImage key={i} path={p} style={{ width: row.charPreview!.length > 1 ? 34 : 72, height: row.charPreview!.length > 1 ? 34 : 72, objectFit: 'cover', borderRadius: 5, border: '1px solid #4f4f7f' }} />
+            ))}
+          </div>
+        )
+        return (
           <div style={{ width: 72, height: 72, background: '#1c1c2e', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <PictureOutlined style={{ color: '#444' }} />
           </div>
-        ),
+        )
+      },
     },
     {
       title: 'Prompt', dataIndex: 'prompt', align: 'center' as const,
@@ -444,34 +570,19 @@ export default function GeneratePage() {
           <div style={{ color: '#444466', fontSize: 11, marginTop: 4, textAlign: 'center' }}>{selSize.w} × {selSize.h} px</div>
         </div>
 
-        {/* Reference images — only show if model supports it */}
+        {/* Character ref info — only show if model supports image ref */}
         {model.refType !== 'NONE' && (
           <div>
             <div style={{ fontSize: 11, color: '#6b6b9a', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 1 }}>
-              Reference Images
+              Image Ref
               <span style={{ marginLeft: 6, fontSize: 10, color: REF_TYPE_COLORS[model.refType],
                 background: REF_TYPE_COLORS[model.refType] + '22', padding: '1px 6px', borderRadius: 4 }}>
                 {REF_TYPE_LABELS[model.refType]}
               </span>
             </div>
-            <Button size="small" icon={<UploadOutlined />} onClick={handleUploadImage}>Browse (multi-select)</Button>
-            {/* Image chips */}
-            {refImages.length > 0 && (
-              <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {refImages.map((img, idx) => (
-                  <div key={idx} style={{ position: 'relative', display: 'inline-flex', alignItems: 'center',
-                    background: '#1c1c2e', border: '1px solid #2d2d4e', borderRadius: 6, padding: '3px 8px 3px 6px',
-                    fontSize: 10, color: img.id ? '#4ade80' : '#818cf8', gap: 4 }}>
-                    <span>{img.path.split(/[/\\]/).pop()?.slice(0,18)}</span>
-                    <span style={{ color: '#555' }}>·</span>
-                    <span>{img.msg}</span>
-                    <button onClick={() => handleRemoveRefImage(idx)}
-                      style={{ marginLeft: 4, background: 'none', border: 'none', color: '#f87171',
-                        cursor: 'pointer', padding: 0, fontSize: 12, lineHeight: 1 }}>×</button>
-                  </div>
-                ))}
-              </div>
-            )}
+            <div style={{ fontSize: 11, color: '#444466', lineHeight: 1.5 }}>
+              Mention a Character name in your prompt — it will be auto-detected and uploaded as an image reference.
+            </div>
           </div>
         )}
 
@@ -530,6 +641,8 @@ export default function GeneratePage() {
             </Text>
             <Space size={6}>
               <Button size="small" icon={<FileTextOutlined />} onClick={handleLoadPromptsFile}>Load prompts.txt</Button>
+              <Button size="small" icon={<FolderOpenOutlined />} onClick={handleFolderImport}>Chọn folder</Button>
+              <Button size="small" type="primary" ghost onClick={handleParse}>Parse</Button>
               <Button size="small" danger onClick={() => setPromptText('')}>Clear</Button>
             </Space>
           </div>

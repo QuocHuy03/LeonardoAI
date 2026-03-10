@@ -67,6 +67,21 @@ function initSchema() {
       created_at   TEXT DEFAULT (datetime('now'))
     )
   `)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS characters (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      image_path  TEXT NOT NULL,
+      created_at  TEXT DEFAULT (datetime('now'))
+    )
+  `)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `)
   // Migrate: add project_id column if missing (for existing DBs)
   try { db.run(`ALTER TABLE generations ADD COLUMN project_id INTEGER DEFAULT NULL`) } catch {}
   saveDb()
@@ -212,4 +227,43 @@ export async function listGenerations(projectId?: number) {
     console.error('[DB] listGenerations FAILED:', e)
     return []
   }
+}
+
+// ── Characters ────────────────────────────────────────────────────────────────
+export async function createCharacter(name: string, description: string, imagePath: string) {
+  const d = await getDb()
+  d.run(`INSERT INTO characters (name, description, image_path) VALUES (?, ?, ?)`, [name.trim(), description.trim(), imagePath])
+  saveDb()
+  const result = d.exec(`SELECT last_insert_rowid() as id`)
+  return result[0]?.values[0][0] as number
+}
+
+export async function listCharacters() {
+  const d = await getDb()
+  const res = d.exec(`SELECT id, name, description, image_path, created_at FROM characters ORDER BY id DESC`)
+  if (!res.length) return []
+  const cols = res[0].columns
+  return res[0].values.map((r: any[]) =>
+    Object.fromEntries(cols.map((c: string, i: number) => [c, r[i]]))
+  )
+}
+
+export async function deleteCharacter(id: number) {
+  const d = await getDb()
+  d.run(`DELETE FROM characters WHERE id = ?`, [id])
+  saveDb()
+}
+
+// ── Settings ──────────────────────────────────────────────────────────
+export async function getSetting(key: string): Promise<string | null> {
+  const d = await getDb()
+  const res = d.exec(`SELECT value FROM settings WHERE key = ?`, [key])
+  if (!res.length || !res[0].values.length) return null
+  return res[0].values[0][0] as string
+}
+
+export async function saveSetting(key: string, value: string) {
+  const d = await getDb()
+  d.run(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`, [key, value])
+  saveDb()
 }

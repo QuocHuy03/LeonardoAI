@@ -1,11 +1,16 @@
 import { ipcMain, dialog, BrowserWindow } from 'electron'
 import fs from 'fs'
+import path from 'path'
 import AdmZip from 'adm-zip'
+import axios from 'axios'
+import { machineIdSync } from 'node-machine-id'
 import {
   addCookie, listCookies, deleteCookie,
   updateCookieTokens, getCookieById, getAllCookieStrings,
   logGeneration, updateGenStatus, listGenerations, deleteGeneration,
-  createProject, listProjects, deleteProject
+  createProject, listProjects, deleteProject,
+  createCharacter, listCharacters, deleteCharacter,
+  getSetting, saveSetting,
 } from './db'
 import { getTokenFromCookie, getUserInfo, createGeneration, pollStatus, getImageUrls, uploadImagePath } from './leonardoApi'
 
@@ -207,6 +212,73 @@ export function registerIpc() {
     return { ok: true }
   })
 
+  // ── Characters ─────────────────────────────────────────────────────────────
+  ipcMain.handle('characters:list', async () => listCharacters())
+
+  ipcMain.handle('characters:browse', async () => {
+    const { filePaths } = await dialog.showOpenDialog(getWin(), {
+      title: 'Chọn ảnh nhân vật',
+      filters: [{ name: 'Images', extensions: ['jpg','jpeg','png','webp'] }],
+      properties: ['openFile'],
+    })
+    return filePaths.length ? filePaths[0] : null
+  })
+
+  ipcMain.handle('characters:create', async (_, name: string, description: string, imagePath: string) => {
+    // Copy image to persistent userData dir so path stays valid
+    const { app } = await import('electron')
+    const destDir = path.join(app.getPath('userData'), 'characters')
+    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true })
+    const ext  = path.extname(imagePath)
+    const dest = path.join(destDir, `${Date.now()}${ext}`)
+    fs.copyFileSync(imagePath, dest)
+    const id = await createCharacter(name, description, dest)
+    return { ok: true, id }
+  })
+
+  ipcMain.handle('characters:delete', async (_, id: number) => {
+    await deleteCharacter(id)
+    return { ok: true }
+  })
+
+  // ── Read local file as base64 data URL (for displaying local images) ─────────
+  ipcMain.handle('file:readImage', async (_, filePath: string) => {
+    try {
+      const buf = fs.readFileSync(filePath)
+      const ext  = path.extname(filePath).slice(1).toLowerCase()
+      const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg'
+      return `data:${mime};base64,${buf.toString('base64')}`
+    } catch { return null }
+  })
+
+  // ── Folder: browse + scan ────────────────────────────────────────────────
+  ipcMain.handle('folder:browse', async () => {
+    const { filePaths } = await dialog.showOpenDialog(getWin(), {
+      title: 'Chọn thư mục ảnh',
+      properties: ['openDirectory'],
+    })
+    return filePaths[0] ?? null
+  })
+
+  ipcMain.handle('folder:scan', async (_, folderPath: string) => {
+    const IMG_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp'])
+    const entries = fs.readdirSync(folderPath).sort()
+
+    const images  = entries
+      .filter(f => IMG_EXT.has(path.extname(f).toLowerCase()))
+      .map(f => path.join(folderPath, f))
+
+    // Read prompts.txt if present (one line per image, matched by sort order)
+    let prompts: string[] = []
+    const promptFile = path.join(folderPath, 'prompts.txt')
+    if (fs.existsSync(promptFile)) {
+      prompts = fs.readFileSync(promptFile, 'utf8')
+        .split('\n').map((l: string) => l.trim()).filter((l: string) => l.length > 0)
+    }
+
+    return { images, prompts }
+  })
+
   // ── File save (single image) ────────────────────────────────────
   ipcMain.handle('file:saveImage', async (_, url: string, suggestedName: string) => {
     const { filePath } = await dialog.showSaveDialog(getWin(), {
@@ -244,5 +316,64 @@ export function registerIpc() {
 
     zip.writeZip(filePath)
     return { ok: true, path: filePath }
+  })
+
+  // ── Auth \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  const AUTH_URL = 'https://serverkey.taothaoai.com/api/leonardo_ai/auth'
+
+  ipcMain.handle('auth:verify', async () => {
+    try {
+      const key = await getSetting('auth_key')
+      if (!key) return { success: false }
+
+      const device_id = machineIdSync()
+      const response = await axios.post(AUTH_URL, { key, device_id })
+      const data = response.data ?? {}
+
+      if (data.expires_at) await saveSetting('auth_expires_at', data.expires_at)
+
+      const expires_at = data.expires_at ?? await getSetting('auth_expires_at')
+      return { success: response.status === 200, expires_at }
+    } catch (error: any) {
+      // Server unreachable — fallback to cached expiry for offline grace period
+      const key        = await getSetting('auth_key')
+      const expires_at = await getSetting('auth_expires_at')
+
+      if (!key) return { success: false }
+
+      // If we have a cached expiry and it hasn't passed → allow access
+      if (expires_at) {
+        const expired = new Date(expires_at).getTime() < Date.now()
+        if (!expired) return { success: true, expires_at, offline: true }
+        // Cached expiry has passed → force re-auth
+        return { success: false, expires_at, error: 'Key đã hết hạn' }
+      }
+
+      // No cached expiry — we can't know, deny access
+      return { success: false, error: error.response?.data?.message || error.message }
+    }
+  })
+
+  ipcMain.handle('auth:login', async (_event, key: string) => {
+    try {
+      const device_id = machineIdSync()
+      const response = await axios.post(AUTH_URL, { key, device_id })
+      const data = response.data ?? {}
+      if (response.status === 200) {
+        await saveSetting('auth_key', key)
+        if (data.expires_at) await saveSetting('auth_expires_at', data.expires_at)
+        return { success: true, expires_at: data.expires_at }
+      }
+      return { success: false, error: data.message ?? 'Invalid key' }
+    } catch (error: any) {
+      return { success: false, error: error.response?.data?.message || error.message }
+    }
+  })
+
+  ipcMain.handle('auth:get-device-id', () => machineIdSync())
+
+  ipcMain.handle('auth:logout', async () => {
+    await saveSetting('auth_key', '')
+    await saveSetting('auth_expires_at', '')
   })
 }

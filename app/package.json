@@ -13,6 +13,7 @@
     "antd": "^5.15.3",
     "axios": "^1.6.8",
     "electron-updater": "^6.8.3",
+    "node-machine-id": "^1.1.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "sql.js": "^1.11.0"
@@ -36,7 +37,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/quochuy03/leonardoai"
+    "url": "https://github.com/quochuy03/leonardo-ai"
   },
   "main": "dist-electron/main.js"
 }

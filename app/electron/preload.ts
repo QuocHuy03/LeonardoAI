@@ -43,6 +43,17 @@ contextBridge.exposeInMainWorld('leo', {
   // File
   fileSaveImage: (url: string, name: string) => ipcRenderer.invoke('file:saveImage', url, name),
   fileSaveZip:   (entries: { url: string; filename: string }[], zipName: string) => ipcRenderer.invoke('file:saveZip', entries, zipName),
+  fileReadImage: (filePath: string) => ipcRenderer.invoke('file:readImage', filePath),
+
+  // Folder import
+  folderBrowse: ()                  => ipcRenderer.invoke('folder:browse'),
+  folderScan:   (folderPath: string) => ipcRenderer.invoke('folder:scan', folderPath),
+
+  // Auth
+  authVerify:      ()           => ipcRenderer.invoke('auth:verify'),
+  authLogin:       (key: string) => ipcRenderer.invoke('auth:login', key),
+  authLogout:      ()           => ipcRenderer.invoke('auth:logout'),
+  authGetDeviceId: ()           => ipcRenderer.invoke('auth:get-device-id'),
 
   // Auto-updater
   onUpdaterEvent: (cb: (d: { event: string; data?: any }) => void) => {
@@ -50,4 +61,10 @@ contextBridge.exposeInMainWorld('leo', {
     return () => ipcRenderer.removeAllListeners('updater:event')
   },
   updaterInstall: () => ipcRenderer.send('updater:install'),
+
+  // Characters
+  charactersList:   ()                                                      => ipcRenderer.invoke('characters:list'),
+  charactersBrowse: ()                                                      => ipcRenderer.invoke('characters:browse'),
+  charactersCreate: (name: string, desc: string, imagePath: string)        => ipcRenderer.invoke('characters:create', name, desc, imagePath),
+  charactersDelete: (id: number)                                            => ipcRenderer.invoke('characters:delete', id),
 })

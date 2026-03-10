@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, ipcMain } from 'electron'
+import { app, BrowserWindow, Menu, ipcMain, protocol, net } from 'electron'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
@@ -12,6 +12,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ── Initialize DB before window ──────────────────────────────────────────────
 getDb().catch(console.error)
+
+// ── Custom protocol: localfile:// serves arbitrary local files ───────────────
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'localfile', privileges: { secure: true, standard: true, supportFetchAPI: true } }
+])
 
 // ── Auto-updater setup ───────────────────────────────────────────────────────
 function setupAutoUpdater(win: BrowserWindow) {
@@ -71,6 +76,11 @@ function createWindow() {
 
 
 app.whenReady().then(() => {
+  // Serve local disk files via localfile:// so renderer can display them
+  protocol.handle('localfile', (req) => {
+    const filePath = decodeURIComponent(req.url.replace('localfile://', ''))
+    return net.fetch(`file://${filePath}`)
+  })
   if (process.platform === 'win32') app.setAppUserModelId('Leonardo AI')
   Menu.setApplicationMenu(null)
   registerIpc()
